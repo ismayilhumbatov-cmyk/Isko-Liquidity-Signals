@@ -1,0 +1,5 @@
+ccxt>=4.4.80
+websockets>=12.0
+aiohttp>=3.9
+numpy>=1.26
+python-dotenv>=1.0

@@ -1,0 +1,9 @@
+# secrets - NEVER commit these (the repo is public)
+.env
+# runtime data
+logs/
+state/
+__pycache__/
+*.pyc
+.venv/
+venv/
