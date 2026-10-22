@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # One-command installer / updater for the Liquidity Sweep signal bot.
-# Run on the server as root:
-#   curl -sL https://raw.githubusercontent.com/ismayilhumbatov-cmyk/Isko-Liquidity-Signals/main/install.sh | bash
+# Run on the server as root (no Shift keys needed):
+#   curl --proto-default https raw.githubusercontent.com/ismayilhumbatov-cmyk/isko-liquidity-signals/main/install.sh -o i.sh
+#   bash i.sh GIST_ID
+# GIST_ID = id of a secret GitHub gist holding the two Telegram lines (delete the gist afterwards).
 set -e
 
-REPO="https://github.com/ismayilhumbatov-cmyk/Isko-Liquidity-Signals.git"
+REPO="https://github.com/ismayilhumbatov-cmyk/isko-liquidity-signals.git"
+GIST_ID="$1"
 DIR="/opt/liquidity-sweep-bot"
 
 echo ""
@@ -47,27 +50,46 @@ python3 -m venv .venv
 .venv/bin/pip install -q --upgrade pip
 .venv/bin/pip install -q -r requirements.txt
 
-# 5) Telegram settings (Enter = keep the value already saved)
+# 5) Telegram settings
+#    Order: secret gist (if GIST_ID given) -> values already in .env -> old bot's files -> ask.
 [ -f .env ] || cp .env.example .env
-OLD_TOKEN=$(grep -E "^TELEGRAM_BOT_TOKEN=" .env | tail -1 | cut -d= -f2-)
-OLD_CHAT=$(grep -E "^TELEGRAM_CHAT_ID=" .env | tail -1 | cut -d= -f2-)
-echo ""
-if [ -n "$OLD_TOKEN" ]; then
-  read -rp "Telegram bot token (press Enter to keep the saved one): " TOKEN </dev/tty
-else
-  read -rp "Paste your Telegram bot token and press Enter: " TOKEN </dev/tty
+TOKEN=""; CHAT=""
+TOKEN_RE='[0-9]{6,12}:[A-Za-z0-9_-]{30,}'
+
+if [ -n "$GIST_ID" ]; then
+  echo "Reading Telegram details from your gist..."
+  GIST=$(curl -sL "https://gist.githubusercontent.com/ismayilhumbatov-cmyk/$GIST_ID/raw" || true)
+  TOKEN=$(echo "$GIST" | grep -oE "$TOKEN_RE" | head -1)
+  CHAT=$(echo "$GIST" | grep -iE "chat" | grep -oE -- "-?[0-9]{5,}" | head -1)
 fi
-if [ -n "$OLD_CHAT" ]; then
-  read -rp "Telegram chat ID (press Enter to keep the saved one): " CHAT </dev/tty
-else
-  read -rp "Paste your Telegram chat ID and press Enter: " CHAT </dev/tty
+if [ -z "$TOKEN" ]; then
+  TOKEN=$(grep -E "^TELEGRAM_BOT_TOKEN=" .env | tail -1 | cut -d= -f2- | tr -d '[:space:]')
 fi
-TOKEN=$(echo "${TOKEN:-$OLD_TOKEN}" | tr -d '[:space:]')
-CHAT=$(echo "${CHAT:-$OLD_CHAT}" | tr -d '[:space:]')
+if [ -z "$CHAT" ]; then
+  CHAT=$(grep -E "^TELEGRAM_CHAT_ID=" .env | tail -1 | cut -d= -f2- | tr -d '[:space:]')
+fi
 if [ -z "$TOKEN" ] || [ -z "$CHAT" ]; then
-  echo "Token and chat ID are both needed. Run the command again."
+  echo "Looking for the old bot's Telegram settings on this server..."
+  OLDFILES=$(find /opt /root /home /srv /etc/systemd/system -maxdepth 4 -type f \
+             \( -name ".env" -o -name "*.service" -o -name "*.env" \) 2>/dev/null | grep -v "$DIR/" || true)
+  for f in $OLDFILES; do
+    [ -z "$TOKEN" ] && TOKEN=$(grep -oE "$TOKEN_RE" "$f" 2>/dev/null | head -1)
+    [ -z "$CHAT" ] && CHAT=$(grep -iE "chat" "$f" 2>/dev/null | grep -oE -- "-?[0-9]{5,}" | head -1)
+  done
+fi
+if [ -z "$TOKEN" ]; then
+  read -rp "Telegram bot token: " TOKEN </dev/tty
+fi
+if [ -z "$CHAT" ]; then
+  read -rp "Telegram chat ID: " CHAT </dev/tty
+fi
+TOKEN=$(echo "$TOKEN" | tr -d '[:space:]')
+CHAT=$(echo "$CHAT" | tr -d '[:space:]')
+if [ -z "$TOKEN" ] || [ -z "$CHAT" ]; then
+  echo "Telegram token or chat ID missing. Check your gist and run again."
   exit 1
 fi
+echo "Telegram token found: ${TOKEN:0:6}...  chat ID: $CHAT"
 sed -i "/^TELEGRAM_BOT_TOKEN=/d; /^TELEGRAM_CHAT_ID=/d" .env
 echo "TELEGRAM_BOT_TOKEN=$TOKEN" >> .env
 echo "TELEGRAM_CHAT_ID=$CHAT" >> .env
