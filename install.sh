@@ -36,13 +36,38 @@ apt-get install -y -qq python3 python3-venv git >/dev/null
 # 3) Code: fresh download, or update if already installed
 if [ -d "$DIR/.git" ]; then
   echo "Updating the bot..."
-  git -C "$DIR" pull -q
+  git -C "$DIR" fetch -q origin
+  git -C "$DIR" reset -q --hard origin/HEAD
 else
   rm -rf "$DIR"
   echo "Downloading the bot..."
   git clone -q "$REPO" "$DIR"
 fi
 cd "$DIR"
+
+# If the bot files were uploaded to the main page of the repo instead of a "bot" folder,
+# put them into the "bot" folder here (the code expects bot/strategy.py etc.).
+if [ -f strategy.py ]; then
+  if ! git ls-files --error-unmatch bot/strategy.py >/dev/null 2>&1; then
+    rm -rf bot
+    mkdir -p bot
+    for f in __init__ config heatmap indicators market_data notifier state strategy symbols tracker utils zones; do
+      [ -f "$f.py" ] && cp "$f.py" "bot/$f.py"
+    done
+    [ -f bot/__init__.py ] || touch bot/__init__.py
+    echo "Bot files arranged into the bot folder."
+  fi
+fi
+
+# check that the bot code is really in the GitHub repo
+for need in main.py requirements.txt bot/strategy.py; do
+  if [ ! -f "$need" ]; then
+    echo ""
+    echo "ERROR: $need is missing in the GitHub repo."
+    echo "Upload the missing files/folders to GitHub (main page of the repo), then run this again."
+    exit 1
+  fi
+done
 
 # 4) Python libraries
 echo "Installing libraries..."
@@ -95,7 +120,23 @@ echo "TELEGRAM_BOT_TOKEN=$TOKEN" >> .env
 echo "TELEGRAM_CHAT_ID=$CHAT" >> .env
 
 # 6) Run as a service (starts now and after every reboot)
-cp deploy/liquidity-bot.service /etc/systemd/system/liquidity-bot.service
+cat > /etc/systemd/system/liquidity-bot.service <<SERVICE
+[Unit]
+Description=Liquidity Sweep Binance Futures signal bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$DIR
+ExecStart=$DIR/.venv/bin/python main.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
 systemctl daemon-reload
 systemctl enable -q liquidity-bot
 systemctl restart liquidity-bot
