@@ -10,7 +10,11 @@ from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv()  # .env on the server: Telegram token + chat ID (secret)
+# settings.env comes from GitHub and holds the strategy numbers (no secrets).
+# It is loaded last, so its values win. Edit it on GitHub, then re-run the installer.
+_SETTINGS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "settings.env")
+load_dotenv(_SETTINGS, override=True)
 
 
 def _str(name: str, default: str = "") -> str:
@@ -105,6 +109,7 @@ class Config:
     cooldown_min: float = field(default_factory=lambda: _float("COOLDOWN_MINUTES", 30))
     eval_interval_sec: float = field(default_factory=lambda: _float("EVAL_INTERVAL_SEC", 2))
     coinglass_api_key: str = field(default_factory=lambda: _str("COINGLASS_API_KEY"))
+    status_hours: float = field(default_factory=lambda: _float("STATUS_HOURS", 6))   # 0 = off
     log_level: str = field(default_factory=lambda: _str("LOG_LEVEL", "INFO").upper())
 
     def __post_init__(self):

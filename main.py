@@ -42,6 +42,7 @@ class Bot:
         self.states: dict[str, SymbolState] = {}
         self.feed = None
         self.feed_task: asyncio.Task | None = None
+        self.signals_sent = 0
 
     async def rebuild_zones(self, st: SymbolState) -> None:
         """Rule 1: refresh the 4H liquidity map of one pair."""
@@ -102,6 +103,25 @@ class Bot:
         log.error("Data feed stopped: %s - restarting in 10s", task.exception())
         asyncio.get_running_loop().call_later(10, self._restart_feed)
 
+    async def status_reporter(self) -> None:
+        """Every STATUS_HOURS: a short Telegram report, so you see the bot is alive."""
+        if self.cfg.status_hours <= 0:
+            return
+        while True:
+            await asyncio.sleep(self.cfg.status_hours * 3600)
+            s = self.strategy
+            top = ", ".join(f"{k} {v}" for k, v in s.missing.most_common(4)) or "none"
+            await self.tg.send(
+                f"📊 <b>Status — last {self.cfg.status_hours:g}h</b>\n"
+                f"Coins scanned: {len(self.states)}\n"
+                f"Signals sent: {self.signals_sent}\n"
+                f"Open signals: {len(self.tracker.open)}\n"
+                f"RSI trigger moments without signal: {s.rsi_moments}\n"
+                f"Most common reason: {top}"
+            )
+            self.signals_sent, s.rsi_moments = 0, 0
+            s.missing.clear()
+
     async def evaluator(self) -> None:
         """Every EVAL_INTERVAL_SEC: follow open signals, then look for new setups."""
         while True:
@@ -126,6 +146,7 @@ class Bot:
                     if sig:
                         st.cooldown_until = time.time() + self.cfg.cooldown_min * 60
                         await self.tracker.publish(sig, st.volume_24h)
+                        self.signals_sent += 1
                 except Exception:
                     log.exception("evaluation error on %s", st.symbol)
             await asyncio.sleep(self.cfg.eval_interval_sec)
@@ -151,7 +172,8 @@ class Bot:
         )
         self.journal.write("start", pairs=list(pairs))
         self._restart_feed()
-        await asyncio.gather(self.evaluator(), self.zone_refresher(), self.pair_refresher())
+        await asyncio.gather(self.evaluator(), self.zone_refresher(), self.pair_refresher(),
+                             self.status_reporter())
 
     async def close(self) -> None:
         for closer in (self.ex.close, self.tg.close, self.heatmap.close):

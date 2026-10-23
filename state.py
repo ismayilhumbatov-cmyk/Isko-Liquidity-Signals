@@ -20,4 +20,5 @@ class SymbolState:
     tick_high: float | None = None  # highest price seen since the last evaluation (for exits)
     tick_low: float | None = None
     updated: bool = False
-    volume_24h: float = 0.0         # 24h traded value in USDT (refreshed every PAIR_REFRESH_MIN)           # new market data arrived since the last evaluation
+    volume_24h: float = 0.0
+    last_diag_ms: int = 0           # last "near miss" log for this pair         # 24h traded value in USDT (refreshed every PAIR_REFRESH_MIN)           # new market data arrived since the last evaluation

@@ -30,6 +30,7 @@ RULE 4 targets:
   TP2 (rest) = the next liquidity zone after that, otherwise TP2_R x risk.
 """
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
 
 from .indicators import atr, rsi_series
@@ -67,6 +68,8 @@ class Signal:
 class Strategy:
     def __init__(self, cfg):
         self.cfg = cfg
+        self.rsi_moments = 0          # RSI hit the trigger level (for the status report)
+        self.missing = Counter()      # which condition blocked those moments
 
     # ------------------------------------------------------------------ main
     def evaluate(self, st: SymbolState, now_ms: int) -> Signal | None:
@@ -105,7 +108,49 @@ class Strategy:
             return sig
         # 3) new LONG sweep to arm?
         self._check_long_arm(st, ctx)
+        if not st.armed_long:
+            self._diagnose(st, ctx)
         return None
+
+    # ------------------------------------------------- near-miss diagnosis
+    def _diagnose(self, st: SymbolState, x: dict) -> None:
+        """When RSI reaches the trigger but no signal comes, log which condition was missing.
+        Max once per 5 minutes per pair. Shown in logs and in the Telegram status report."""
+        cfg, rsi = self.cfg, x["rsi"]
+        if rsi > cfg.rsi_short:
+            side, kind = "SHORT", "resistance"
+        elif rsi <= cfg.rsi_long:
+            side, kind = "LONG", "support"
+        else:
+            return
+        if x["now_ms"] - st.last_diag_ms < 300_000:
+            return
+        st.last_diag_ms = x["now_ms"]
+        live, atr5, price, a4 = x["live"], x["atr5"], x["price"], st.atr_4h
+        reach = max(cfg.zone_proximity_atr, cfg.max_overshoot_atr) * a4
+        at_zone = any(z.kind == kind and z.bottom - reach <= price <= z.top + reach for z in st.zones)
+        body = abs(live[C] - live[O])
+        rng = live[H] - live[L]
+        missing = []
+        if not at_zone:
+            missing.append("not at a 4H zone")
+        if body < cfg.big_candle_atr * atr5:
+            missing.append("candle too small")
+        if x["vol_ratio"] < cfg.vol_expansion:
+            missing.append("volume too low")
+        if not x["htf_ok"]:
+            missing.append("4H volume climax")
+        if side == "SHORT" and rng > 0 and (live[C] - live[L]) / rng < cfg.upper_part:
+            missing.append("price not at top of candle")
+        if side == "SHORT" and live[C] <= live[O]:
+            missing.append("candle not green")
+        if side == "LONG" and live[C] >= live[O]:
+            missing.append("candle not red")
+        self.rsi_moments += 1
+        for m in missing or ["other"]:
+            self.missing[m] += 1
+        log.info("%s %s near miss | RSI %.1f | candle %.1fx ATR | volume %.1fx | missing: %s",
+                 st.symbol, side, rsi, body / atr5, x["vol_ratio"], ", ".join(missing) or "other")
 
     # ----------------------------------------------------- RULE 3 (4H volume)
     def _htf_volume_ok(self, st: SymbolState, now_ms: int) -> tuple[bool, str]:
