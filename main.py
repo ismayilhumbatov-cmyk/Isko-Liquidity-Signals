@@ -87,34 +87,43 @@ class Bot:
 
     # ----------------------------------------------------------- status
     async def status_reporter(self) -> None:
+        """First report 20 minutes after start, then every STATUS_HOURS."""
         if self.cfg.status_hours <= 0:
             return
+        await asyncio.sleep(20 * 60)
         while True:
-            await asyncio.sleep(self.cfg.status_hours * 3600)
             try:
                 await self._send_status()
             except Exception:
                 log.exception("status report failed")
+            await asyncio.sleep(self.cfg.status_hours * 3600)
 
     async def _send_status(self) -> None:
-        up = down = flat = 0
+        up = down = flat = long_ok = short_ok = 0
         for st in list(self.states.values()):
             t = self.strategy.trend_4h(st)
             up += t == "UP"
             down += t == "DOWN"
             flat += t is None
+            side, _ = self.strategy.direction(st)
+            long_ok += side == "LONG"
+            short_ok += side == "SHORT"
         s = self.strategy.stats
         data = "REST polling (slower)" if self.feed and self.feed.use_rest else "live"
-        await self.tg.send(
-            f"📊 <b>Status — last {self.cfg.status_hours:g}h</b>\n"
-            f"Coins scanned: {len(self.states)}  (data: {data})\n"
-            f"4H trend now: {up} up • {down} down • {flat} no trend\n"
-            f"1m EMA 50 crosses with trend: {s['crosses']}\n"
-            f"Retests: {s['retests']}\n"
-            f"Not confirmed in {self.cfg.retest_window_min:g} min: {s['expired']}\n"
-            f"Failed (closed back through EMA): {s['failed']}\n"
+        newest = max((st.candles["1m"][-1][0] for st in self.states.values() if st.candles["1m"]), default=0)
+        age = (now_ms() - newest) / 60000 if newest else -1
+        text = (
+            f"📊 <b>Status</b>\n"
+            f"Coins: {len(self.states)}  •  data: {data}  •  newest 1m candle: {age:.0f} min old\n"
+            f"1m candles checked: {s['candles']}\n"
+            f"4H trend: {up} up • {down} down • {flat} no trend\n"
+            f"Ready now (4H + 15m agree): {long_ok} LONG • {short_ok} SHORT\n"
+            f"Crosses with trend: {s['crosses']}  •  Retests: {s['retests']}\n"
+            f"Expired: {s['expired']}  •  Failed: {s['failed']}  •  Weak volume: {s['low_volume']}\n"
             f"Signals sent: {s['signals']}  •  Open: {len(self.tracker.open)}"
         )
+        log.info("STATUS %s", text.replace("\n", " | "))
+        await self.tg.send(text)
         s.clear()
 
     # --------------------------------------------------------- strategy

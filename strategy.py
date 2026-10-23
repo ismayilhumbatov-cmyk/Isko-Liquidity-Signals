@@ -118,6 +118,7 @@ class Strategy:
         if not new:
             return None
         st.last_closed_checked = closed[-1][T]
+        self.stats["candles"] += len(new)
         if len(new) > 3:                  # after a data gap, only look at the latest candles
             new = new[-3:]
 
@@ -148,6 +149,8 @@ class Strategy:
         close_tol = cfg.close_tolerance_atr * a1
 
         side, why_not = self.direction(st)
+        if side is None:
+            self.stats["no_direction"] += 1
         s = st.setup
 
         # ---- an active setup: check expiry, direction, failure, retest, confirmation
