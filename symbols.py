@@ -9,7 +9,7 @@ Pair selection.
 * The list is refreshed every PAIR_REFRESH_MIN minutes: coins that gain volume are
   added, coins that lose it are removed.
 * Stablecoin pairs (USDCUSDT, FDUSDUSDT, TUSDUSDT ...) and non-crypto contracts
-  (gold, stocks and other TradFi perpetuals) are always removed.
+  (gold XAUUSDT, gold tokens PAXG/XAUT, silver, stocks, indexes) are always removed.
 """
 import logging
 
@@ -20,6 +20,24 @@ STABLECOINS = {
     "USDS", "USD1", "RLUSD", "SUSD", "GUSD", "LUSD", "FRAX", "UST", "USTC", "EUR", "EURI",
     "AEUR", "EURC", "XUSD", "BFUSD", "USDX", "USDB", "USD0", "USDF", "USDG",
 }
+
+
+# Gold / silver / metals and their tokens, plus stock and index contracts:
+# they move like traditional markets, not like volatile crypto, so they are excluded.
+NON_CRYPTO = {
+    "XAU", "XAG", "XPT", "XPD", "PAXG", "XAUT", "KAU", "KAG",
+    "TSLA", "NVDA", "AAPL", "AMZN", "GOOGL", "GOOG", "META", "MSFT", "NFLX", "AMD", "INTC",
+    "MSTR", "COIN", "HOOD", "CRCL", "PLTR", "SPY", "QQQ", "SPX", "NDX", "DJI", "OIL", "WTI", "BRENT",
+}
+
+
+def is_non_crypto(market: dict) -> bool:
+    base = (market.get("base") or "").upper()
+    if base in NON_CRYPTO:
+        return True
+    info = market.get("info", {}) or {}
+    tags = " ".join(str(t) for t in (info.get("underlyingSubType") or [])).lower()
+    return any(word in tags for word in ("tradfi", "commodit", "stock", "metal", "index"))
 
 
 def is_stablecoin(base: str) -> bool:
@@ -39,6 +57,7 @@ def _allowed(market: dict) -> bool:
         and info.get("underlyingType", "COIN") == "COIN"
         and info.get("status", "TRADING") == "TRADING"
         and not is_stablecoin(market.get("base", ""))
+        and not is_non_crypto(market)
     )
 
 

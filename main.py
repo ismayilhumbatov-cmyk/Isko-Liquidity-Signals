@@ -9,6 +9,7 @@ Run:  python main.py
 All settings are in .env (see .env.example and README.md).
 """
 import asyncio
+import html
 import logging
 import signal
 import time
@@ -52,43 +53,52 @@ class Bot:
         log.info("%s: %d zones | %s", st.symbol, len(st.zones),
                  " | ".join(z.describe() for z in st.zones[:4]) or "none")
 
+    async def safe_rebuild(self, st: SymbolState) -> None:
+        """Rebuild zones; an error on one coin is logged and never stops the bot."""
+        try:
+            await self.rebuild_zones(st)
+        except Exception:
+            log.exception("zone build failed for %s", st.symbol)
+
     async def zone_refresher(self) -> None:
         """Safety refresh every 30 minutes (each 4H close also rebuilds instantly)."""
         while True:
             await asyncio.sleep(1800)
             for st in list(self.states.values()):
-                await self.rebuild_zones(st)
+                await self.safe_rebuild(st)
 
     async def pair_refresher(self) -> None:
         """Every PAIR_REFRESH_MIN: add coins that now have enough volume, drop coins that lost it."""
         while True:
             await asyncio.sleep(self.cfg.pair_refresh_min * 60)
             try:
-                fresh = await select_symbols(self.ex, self.cfg)
-            except Exception as e:
-                log.warning("pair refresh failed: %s", e)
-                continue
-            for pid, (_, vol) in fresh.items():          # update 24h volume of known pairs
-                if pid in self.states:
-                    self.states[pid].volume_24h = vol
-            added = [pid for pid in fresh if pid not in self.states]
-            removed = [pid for pid in self.states if pid not in fresh and not self.tracker.has_open(pid)]
-            if not added and not removed:
-                continue
-            for pid in removed:
-                self.states.pop(pid, None)
-            new_states = []
-            for pid in added:
-                sym, vol = fresh[pid]
-                st = SymbolState(pid, sym, volume_24h=vol)
-                self.states[pid] = st
-                new_states.append(st)
-            await self.feed.bootstrap(new_states)
-            for st in new_states:
-                await self.rebuild_zones(st)
-            self._restart_feed()                         # live streams for the new pair list
-            log.info("Pairs updated: +%d %s | -%d %s | now %d", len(added), ",".join(added),
-                     len(removed), ",".join(removed), len(self.states))
+                await self._refresh_pairs()
+            except Exception:
+                log.exception("pair refresh failed")
+
+    async def _refresh_pairs(self) -> None:
+        fresh = await select_symbols(self.ex, self.cfg)
+        for pid, (_, vol) in fresh.items():          # update 24h volume of known pairs
+            if pid in self.states:
+                self.states[pid].volume_24h = vol
+        added = [pid for pid in fresh if pid not in self.states]
+        removed = [pid for pid in self.states if pid not in fresh and not self.tracker.has_open(pid)]
+        if not added and not removed:
+            return
+        for pid in removed:
+            self.states.pop(pid, None)
+        new_states = []
+        for pid in added:
+            sym, vol = fresh[pid]
+            st = SymbolState(pid, sym, volume_24h=vol)
+            self.states[pid] = st
+            new_states.append(st)
+        await self.feed.bootstrap(new_states)
+        for st in new_states:
+            await self.safe_rebuild(st)
+        self._restart_feed()                         # live streams for the new pair list
+        log.info("Pairs updated: +%d %s | -%d %s | now %d", len(added), ",".join(added),
+                 len(removed), ",".join(removed), len(self.states))
 
     def _restart_feed(self) -> None:
         if self.feed_task and not self.feed_task.done():
@@ -109,6 +119,13 @@ class Bot:
             return
         while True:
             await asyncio.sleep(self.cfg.status_hours * 3600)
+            try:
+                await self._send_status()
+            except Exception:
+                log.exception("status report failed")
+
+    async def _send_status(self) -> None:
+        if True:  # keeps the original indentation
             s = self.strategy
             top = ", ".join(f"{k} {v}" for k, v in s.missing.most_common(4)) or "none"
             await self.tg.send(
@@ -126,7 +143,8 @@ class Bot:
         """Every EVAL_INTERVAL_SEC: follow open signals, then look for new setups."""
         while True:
             now = now_ms()
-            for st in list(self.states.values()):
+            states = list(self.states.values())
+            for st in states:
                 if not st.updated:
                     continue
                 st.updated = False
@@ -162,7 +180,7 @@ class Bot:
         self.feed = MarketFeed(cfg, self.ex, self.states, self.rebuild_zones)
         await self.feed.bootstrap()
         for st in self.states.values():
-            await self.rebuild_zones(st)
+            await self.safe_rebuild(st)
 
         await self.tg.send(
             f"🤖 <b>Liquidity Sweep signal bot started</b>\n"
@@ -194,12 +212,20 @@ async def main() -> None:
             loop.add_signal_handler(sig, task.cancel)
         except NotImplementedError:  # Windows
             pass
+    error = None
     try:
         await bot.run()
     except asyncio.CancelledError:
         log.info("Stopping...")
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        log.exception("Bot crashed")
+        raise
     finally:
-        await bot.tg.send("⏹ Liquidity Sweep signal bot stopped.")
+        if error:
+            await bot.tg.send(f"⚠️ Bot error, restarting in 10 seconds:\n<code>{html.escape(error[:300])}</code>")
+        else:
+            await bot.tg.send("⏹ Liquidity Sweep signal bot stopped.")
         await bot.close()
 
 
