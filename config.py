@@ -1,18 +1,19 @@
 """
 Configuration.
 
-Every setting comes from environment variables (or a .env file in the project
-folder). This is a SIGNAL-ONLY bot: it never places orders and needs no Binance keys. Nothing secret is ever written in the code, so the GitHub repo can stay
-public as long as the .env file is never committed (it is in .gitignore).
+Values come from (last one wins):
+  1. the defaults written below
+  2. .env on the server        - Telegram token and chat ID (secret, never on GitHub)
+  3. settings.env from GitHub  - strategy numbers (edit it on GitHub, then re-run the installer)
+
+This is a SIGNAL-ONLY bot: it never places orders and needs no Binance keys.
 """
 import os
 from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
-load_dotenv()  # .env on the server: Telegram token + chat ID (secret)
-# settings.env comes from GitHub and holds the strategy numbers (no secrets).
-# It is loaded last, so its values win. Edit it on GitHub, then re-run the installer.
+load_dotenv()
 _SETTINGS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "settings.env")
 load_dotenv(_SETTINGS, override=True)
 
@@ -41,75 +42,55 @@ def _list(name: str, default: str = "") -> list:
 @dataclass
 class Config:
     # ---------------------------------------------------------- market data
-    # Uses public Binance market data, no API keys and no orders.
-    ws_url: str = field(default_factory=lambda: _str("WS_URL", ""))           # empty = automatic
-    data_source: str = field(default_factory=lambda: _str("DATA_SOURCE", "ws").lower())  # ws | rest
+    ws_url: str = field(default_factory=lambda: _str("WS_URL", ""))
+    data_source: str = field(default_factory=lambda: _str("DATA_SOURCE", "ws").lower())   # ws | rest
     rest_poll_sec: float = field(default_factory=lambda: _float("REST_POLL_SEC", 10))
 
     # -------------------------------------------------------------- telegram
     telegram_token: str = field(default_factory=lambda: _str("TELEGRAM_BOT_TOKEN"))
     telegram_chat_id: str = field(default_factory=lambda: _str("TELEGRAM_CHAT_ID"))
-    notify_armed: bool = field(default_factory=lambda: _bool("NOTIFY_ARMED", False))
 
-    # ----------------------------------------------------------------- pairs
-    # SCAN_ALL=true: scan EVERY Binance USDT perpetual crypto coin that has enough 24h volume.
-    # SCAN_ALL=false: scan only the coins in PAIRS (the volume rule still applies).
+    # ----------------------------------------------------------------- coins
     scan_all: bool = field(default_factory=lambda: _bool("SCAN_ALL", True))
-    min_24h_volume: float = field(default_factory=lambda: _float("MIN_24H_VOLUME_USDT", 20_000_000))
+    min_24h_volume: float = field(default_factory=lambda: _float("MIN_24H_VOLUME_USDT", 3_000_000))
     pair_refresh_min: float = field(default_factory=lambda: _float("PAIR_REFRESH_MIN", 60))
-    max_pairs: int = field(default_factory=lambda: _int("MAX_PAIRS", 0))      # 0 = no limit
+    max_pairs: int = field(default_factory=lambda: _int("MAX_PAIRS", 0))
     pairs: list = field(default_factory=lambda: _list("PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT"))
     exclude_pairs: list = field(default_factory=lambda: _list("EXCLUDE_PAIRS", ""))
 
-    # ------------------------------------------- shown in the signal message
-    risk_pct: float = field(default_factory=lambda: _float("RISK_PCT", 1.0))
-    leverage: int = field(default_factory=lambda: _int("LEVERAGE", 10))
-    max_sl_pct: float = field(default_factory=lambda: _float("MAX_SL_PCT", 4.0))   # skip setups whose stop is wider than this %
+    # -------------------------------------------------- step 1: 4H trend
+    trend_ema: int = field(default_factory=lambda: _int("TREND_EMA", 50))
+    trend_slope_bars: int = field(default_factory=lambda: _int("TREND_SLOPE_BARS", 3))
 
-    # -------------------------------------------------------- 4H zone mapping
-    htf_candles: int = field(default_factory=lambda: _int("HTF_CANDLES", 300))
-    pivot_len: int = field(default_factory=lambda: _int("PIVOT_LEN", 3))
-    zone_half_width_atr: float = field(default_factory=lambda: _float("ZONE_HALF_WIDTH_ATR", 0.15))
-    ob_impulse_atr: float = field(default_factory=lambda: _float("OB_IMPULSE_ATR", 1.5))
-    min_zone_strength: int = field(default_factory=lambda: _int("MIN_ZONE_STRENGTH", 2))
-    allow_swept_zones: bool = field(default_factory=lambda: _bool("ALLOW_SWEPT_ZONES", False))
-    max_zone_distance_pct: float = field(default_factory=lambda: _float("MAX_ZONE_DISTANCE_PCT", 12))
-    zone_proximity_atr: float = field(default_factory=lambda: _float("ZONE_PROXIMITY_ATR", 0.3))
-    max_overshoot_atr: float = field(default_factory=lambda: _float("MAX_OVERSHOOT_ATR", 0.6))
-    htf_climax_mult: float = field(default_factory=lambda: _float("HTF_CLIMAX_VOL_MULT", 2.5))
+    # ------------------------------------------------ step 2: 15m check
+    use_15m_filter: bool = field(default_factory=lambda: _bool("USE_15M_FILTER", True))
+    mid_ema: int = field(default_factory=lambda: _int("MID_EMA", 50))
 
-    # ---------------------------------------------------------- 5m execution
-    rsi_period: int = field(default_factory=lambda: _int("RSI_PERIOD", 14))
-    rsi_short: float = field(default_factory=lambda: _float("RSI_SHORT_LEVEL", 80))
-    rsi_long: float = field(default_factory=lambda: _float("RSI_LONG_LEVEL", 30))
-    rsi_long_strong: float = field(default_factory=lambda: _float("RSI_LONG_STRONG", 25))
-    big_candle_atr: float = field(default_factory=lambda: _float("BIG_CANDLE_ATR", 1.5))
-    push_atr: float = field(default_factory=lambda: _float("PUSH_ATR", 2.0))
-    upper_part: float = field(default_factory=lambda: _float("UPPER_PART", 0.7))
-    vol_expansion: float = field(default_factory=lambda: _float("VOL_EXPANSION_MULT", 1.5))
-    reclaim_vol: float = field(default_factory=lambda: _float("RECLAIM_VOL_MULT", 1.0))
-    reclaim_atr: float = field(default_factory=lambda: _float("RECLAIM_ATR", 0.3))
-    arm_expiry_bars: int = field(default_factory=lambda: _int("ARM_EXPIRY_BARS", 6))
-    min_candle_progress: float = field(default_factory=lambda: _float("MIN_CANDLE_PROGRESS", 0.2))
+    # ------------------------------------------- step 3: 1m cross/retest
+    entry_ema: int = field(default_factory=lambda: _int("ENTRY_EMA", 50))
+    retest_window_min: float = field(default_factory=lambda: _float("RETEST_WINDOW_MIN", 15))
+    touch_tolerance_atr: float = field(default_factory=lambda: _float("TOUCH_TOLERANCE_ATR", 0.1))
+    close_tolerance_atr: float = field(default_factory=lambda: _float("CLOSE_TOLERANCE_ATR", 0.25))
+    big_candle_mult: float = field(default_factory=lambda: _float("BIG_CANDLE_MULT", 1.5))
+    confirm_vol_mult: float = field(default_factory=lambda: _float("CONFIRM_VOL_MULT", 1.0))
 
-    # ------------------------------------------------------- stops / targets
-    sl_buffer_atr: float = field(default_factory=lambda: _float("SL_BUFFER_ATR", 0.2))
-    min_sl_atr: float = field(default_factory=lambda: _float("MIN_SL_ATR", 0.5))
-    min_sl_pct: float = field(default_factory=lambda: _float("MIN_SL_PCT", 0.3))      # keeps fees small vs risk
-    sweep_room: float = field(default_factory=lambda: _float("SWEEP_ROOM", 0.25))     # SHORT: extra room beyond candle high, as part of candle size
-    tp1_r: float = field(default_factory=lambda: _float("TP1_R", 2.0))
+    # ------------------------------------------------ stop / targets
+    sl_buffer_atr: float = field(default_factory=lambda: _float("SL_BUFFER_ATR", 0.1))
+    min_sl_pct: float = field(default_factory=lambda: _float("MIN_SL_PCT", 0.3))
+    max_sl_pct: float = field(default_factory=lambda: _float("MAX_SL_PCT", 3.0))
+    tp1_r: float = field(default_factory=lambda: _float("TP1_R", 1.5))
     tp2_r: float = field(default_factory=lambda: _float("TP2_R", 3.0))
     tp1_close_pct: float = field(default_factory=lambda: _float("TP1_CLOSE_PCT", 50))
-    use_liquidity_targets: bool = field(default_factory=lambda: _bool("USE_LIQUIDITY_TARGETS", True))
-    min_tp1_r: float = field(default_factory=lambda: _float("MIN_TP1_R", 1.0))
-    max_liq_tp_r: float = field(default_factory=lambda: _float("MAX_LIQ_TP_R", 6.0))
     move_sl_to_be: bool = field(default_factory=lambda: _bool("MOVE_SL_TO_BE_AFTER_TP1", True))
+
+    # ---------------------------------------------- shown in the message
+    risk_pct: float = field(default_factory=lambda: _float("RISK_PCT", 1.0))
+    leverage: int = field(default_factory=lambda: _int("LEVERAGE", 10))
 
     # --------------------------------------------------------------- runtime
     cooldown_min: float = field(default_factory=lambda: _float("COOLDOWN_MINUTES", 30))
     eval_interval_sec: float = field(default_factory=lambda: _float("EVAL_INTERVAL_SEC", 2))
-    coinglass_api_key: str = field(default_factory=lambda: _str("COINGLASS_API_KEY"))
-    status_hours: float = field(default_factory=lambda: _float("STATUS_HOURS", 6))   # 0 = off
+    status_hours: float = field(default_factory=lambda: _float("STATUS_HOURS", 6))
     log_level: str = field(default_factory=lambda: _str("LOG_LEVEL", "INFO").upper())
 
     def __post_init__(self):

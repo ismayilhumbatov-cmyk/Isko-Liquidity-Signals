@@ -11,7 +11,7 @@ GIST_ID="$1"
 DIR="/opt/liquidity-sweep-bot"
 
 echo ""
-echo "=== Liquidity Sweep signal bot - installer ==="
+echo "=== Signal bot - installer ==="
 if [ "$(id -u)" -ne 0 ]; then
   echo "Please log in as root and run again."
   exit 1
@@ -51,8 +51,8 @@ if [ -f strategy.py ]; then
   if ! git ls-files --error-unmatch bot/strategy.py >/dev/null 2>&1; then
     rm -rf bot
     mkdir -p bot
-    for f in __init__ config heatmap indicators market_data notifier state strategy symbols tracker utils zones; do
-      [ -f "$f.py" ] && cp "$f.py" "bot/$f.py"
+    for f in *.py; do
+      [ "$f" = "main.py" ] || cp "$f" "bot/$f"
     done
     [ -f bot/__init__.py ] || touch bot/__init__.py
     echo "Bot files arranged into the bot folder."
@@ -122,7 +122,7 @@ echo "TELEGRAM_CHAT_ID=$CHAT" >> .env
 # 6) Run as a service (starts now and after every reboot)
 cat > /etc/systemd/system/liquidity-bot.service <<SERVICE
 [Unit]
-Description=Liquidity Sweep Binance Futures signal bot
+Description=Binance Futures signal bot
 After=network-online.target
 Wants=network-online.target
 

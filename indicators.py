@@ -48,3 +48,19 @@ def atr(highs, lows, closes, period: int = 14) -> float:
     for x in tr[period:]:
         value = (value * (period - 1) + x) / period
     return float(value)
+
+
+def ema_series(values, period: int = 50) -> list:
+    """Exponential moving average for every candle (None until enough data).
+    Starts from the simple average of the first `period` values, like TradingView."""
+    v = [float(x) for x in values]
+    out = [None] * len(v)
+    if len(v) < period:
+        return out
+    k = 2.0 / (period + 1)
+    e = sum(v[:period]) / period
+    out[period - 1] = e
+    for i in range(period, len(v)):
+        e = v[i] * k + e * (1 - k)
+        out[i] = e
+    return out

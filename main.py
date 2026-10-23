@@ -1,12 +1,11 @@
 """
-Liquidity Sweep / Hunt SIGNAL bot for Binance USDT-M perpetual futures.
+Trend + EMA 50 Retest SIGNAL bot for Binance USDT-M perpetual futures.
 
-The bot never trades. It reads public Binance market data, finds liquidity sweep
-setups and sends them to Telegram (🟢 LONG / 🔴 SHORT), then reports TP1, TP2,
-stop loss or breakeven for each signal.
+The bot never trades. It reads public Binance Futures data and sends signals to Telegram:
+  4H trend  ->  15m check  ->  1m EMA 50 cross, retest, big candle   (🟢 LONG / 🔴 SHORT)
+then reports TP1, TP2, stop loss or breakeven for every signal.
 
-Run:  python main.py
-All settings are in .env (see .env.example and README.md).
+Run:  python main.py      (settings: settings.env from GitHub, Telegram details: .env)
 """
 import asyncio
 import html
@@ -17,17 +16,16 @@ import time
 import ccxt.async_support as ccxt
 
 from bot.config import Config
-from bot.heatmap import CoinglassHeatmap
 from bot.market_data import MarketFeed
-from bot.notifier import Telegram, armed_message
+from bot.notifier import Telegram
 from bot.state import SymbolState
 from bot.strategy import Strategy
 from bot.symbols import select_symbols
 from bot.tracker import SignalTracker
 from bot.utils import Journal, fmt_usd, now_ms, setup_logging
-from bot.zones import build_zones
 
 log = logging.getLogger("main")
+BOT_NAME = "Trend + EMA 50 Retest signal bot"
 
 
 class Bot:
@@ -35,38 +33,14 @@ class Bot:
         self.cfg = cfg
         self.tg = Telegram(cfg.telegram_token, cfg.telegram_chat_id)
         self.journal = Journal()
-        # public market data only: no API keys, no orders
         self.ex = ccxt.binanceusdm({"enableRateLimit": True, "options": {"defaultType": "future"}})
-        self.heatmap = CoinglassHeatmap(cfg.coinglass_api_key)
         self.strategy = Strategy(cfg)
         self.tracker = SignalTracker(cfg, self.tg, self.journal)
         self.states: dict[str, SymbolState] = {}
-        self.feed = None
+        self.feed: MarketFeed | None = None
         self.feed_task: asyncio.Task | None = None
-        self.signals_sent = 0
 
-    async def rebuild_zones(self, st: SymbolState) -> None:
-        """Rule 1: refresh the 4H liquidity map of one pair."""
-        st.zones, st.atr_4h = build_zones(st.candles_4h, now_ms(), self.cfg)
-        if self.heatmap.enabled and st.zones:
-            CoinglassHeatmap.boost(st.zones, await self.heatmap.levels(st.symbol), st.atr_4h)
-        log.info("%s: %d zones | %s", st.symbol, len(st.zones),
-                 " | ".join(z.describe() for z in st.zones[:4]) or "none")
-
-    async def safe_rebuild(self, st: SymbolState) -> None:
-        """Rebuild zones; an error on one coin is logged and never stops the bot."""
-        try:
-            await self.rebuild_zones(st)
-        except Exception:
-            log.exception("zone build failed for %s", st.symbol)
-
-    async def zone_refresher(self) -> None:
-        """Safety refresh every 30 minutes (each 4H close also rebuilds instantly)."""
-        while True:
-            await asyncio.sleep(1800)
-            for st in list(self.states.values()):
-                await self.safe_rebuild(st)
-
+    # ------------------------------------------------------------ coins
     async def pair_refresher(self) -> None:
         """Every PAIR_REFRESH_MIN: add coins that now have enough volume, drop coins that lost it."""
         while True:
@@ -74,11 +48,11 @@ class Bot:
             try:
                 await self._refresh_pairs()
             except Exception:
-                log.exception("pair refresh failed")
+                log.exception("coin list refresh failed")
 
     async def _refresh_pairs(self) -> None:
         fresh = await select_symbols(self.ex, self.cfg)
-        for pid, (_, vol) in fresh.items():          # update 24h volume of known pairs
+        for pid, (_, vol) in fresh.items():
             if pid in self.states:
                 self.states[pid].volume_24h = vol
         added = [pid for pid in fresh if pid not in self.states]
@@ -94,12 +68,11 @@ class Bot:
             self.states[pid] = st
             new_states.append(st)
         await self.feed.bootstrap(new_states)
-        for st in new_states:
-            await self.safe_rebuild(st)
-        self._restart_feed()                         # live streams for the new pair list
-        log.info("Pairs updated: +%d %s | -%d %s | now %d", len(added), ",".join(added),
+        self._restart_feed()
+        log.info("Coins updated: +%d %s | -%d %s | now %d", len(added), ",".join(added),
                  len(removed), ",".join(removed), len(self.states))
 
+    # ------------------------------------------------------------- feed
     def _restart_feed(self) -> None:
         if self.feed_task and not self.feed_task.done():
             self.feed_task.cancel()
@@ -107,14 +80,13 @@ class Bot:
         self.feed_task.add_done_callback(self._feed_stopped)
 
     def _feed_stopped(self, task: asyncio.Task) -> None:
-        """If the data feed ever crashes, log it and start it again after 10 seconds."""
         if task.cancelled():
             return
         log.error("Data feed stopped: %s - restarting in 10s", task.exception())
         asyncio.get_running_loop().call_later(10, self._restart_feed)
 
+    # ----------------------------------------------------------- status
     async def status_reporter(self) -> None:
-        """Every STATUS_HOURS: a short Telegram report, so you see the bot is alive."""
         if self.cfg.status_hours <= 0:
             return
         while True:
@@ -125,76 +97,74 @@ class Bot:
                 log.exception("status report failed")
 
     async def _send_status(self) -> None:
-        if True:  # keeps the original indentation
-            s = self.strategy
-            top = ", ".join(f"{k} {v}" for k, v in s.missing.most_common(4)) or "none"
-            await self.tg.send(
-                f"📊 <b>Status — last {self.cfg.status_hours:g}h</b>\n"
-                f"Coins scanned: {len(self.states)}\n"
-                f"Signals sent: {self.signals_sent}\n"
-                f"Open signals: {len(self.tracker.open)}\n"
-                f"RSI trigger moments without signal: {s.rsi_moments}\n"
-                f"Most common reason: {top}"
-            )
-            self.signals_sent, s.rsi_moments = 0, 0
-            s.missing.clear()
+        up = down = flat = 0
+        for st in list(self.states.values()):
+            t = self.strategy.trend_4h(st)
+            up += t == "UP"
+            down += t == "DOWN"
+            flat += t is None
+        s = self.strategy.stats
+        data = "REST polling (slower)" if self.feed and self.feed.use_rest else "live"
+        await self.tg.send(
+            f"📊 <b>Status — last {self.cfg.status_hours:g}h</b>\n"
+            f"Coins scanned: {len(self.states)}  (data: {data})\n"
+            f"4H trend now: {up} up • {down} down • {flat} no trend\n"
+            f"1m EMA 50 crosses with trend: {s['crosses']}\n"
+            f"Retests: {s['retests']}\n"
+            f"Not confirmed in {self.cfg.retest_window_min:g} min: {s['expired']}\n"
+            f"Failed (closed back through EMA): {s['failed']}\n"
+            f"Signals sent: {s['signals']}  •  Open: {len(self.tracker.open)}"
+        )
+        s.clear()
 
+    # --------------------------------------------------------- strategy
     async def evaluator(self) -> None:
-        """Every EVAL_INTERVAL_SEC: follow open signals, then look for new setups."""
+        """Every EVAL_INTERVAL_SEC: follow open signals, then check new closed 1m candles."""
         while True:
             now = now_ms()
-            states = list(self.states.values())
-            for st in states:
+            for st in list(self.states.values()):
                 if not st.updated:
                     continue
                 st.updated = False
                 try:
                     await self.tracker.on_tick(st)
                     st.tick_high = st.tick_low = None
-                    if self.tracker.has_open(st.symbol):
-                        st.armed_long = None
+                    if self.tracker.has_open(st.symbol) or time.time() < st.cooldown_until:
+                        st.setup = None
+                        st.last_closed_checked = st.candles["1m"][-1][0] if st.candles["1m"] else 0
                         continue
-                    was_armed = st.armed_long is not None
                     sig = self.strategy.evaluate(st, now)
-                    if st.armed_long and not was_armed:
-                        self.journal.write("long_armed", symbol=st.symbol, zone=st.armed_long["zone"].describe(),
-                                           rsi=round(st.armed_long["rsi_min"], 1))
-                        if self.cfg.notify_armed:
-                            await self.tg.send(armed_message(st.symbol, st.armed_long))
                     if sig:
                         st.cooldown_until = time.time() + self.cfg.cooldown_min * 60
                         await self.tracker.publish(sig, st.volume_24h)
-                        self.signals_sent += 1
                 except Exception:
                     log.exception("evaluation error on %s", st.symbol)
             await asyncio.sleep(self.cfg.eval_interval_sec)
 
+    # -------------------------------------------------------------- run
     async def run(self) -> None:
         cfg = self.cfg
         pairs = await select_symbols(self.ex, cfg)
         if not pairs:
-            raise SystemExit("No coins pass the volume filter - check MIN_24H_VOLUME_USDT / PAIRS")
+            raise SystemExit("No coins pass the volume filter - check MIN_24H_VOLUME_USDT")
         self.states = {pid: SymbolState(pid, sym, volume_24h=vol) for pid, (sym, vol) in pairs.items()}
-        log.info("Loading history for %d pairs (takes a few minutes with many coins)...", len(pairs))
-
-        self.feed = MarketFeed(cfg, self.ex, self.states, self.rebuild_zones)
+        log.info("Loading history for %d coins (a few minutes)...", len(pairs))
+        self.feed = MarketFeed(cfg, self.ex, self.states)
         await self.feed.bootstrap()
-        for st in self.states.values():
-            await self.safe_rebuild(st)
 
         await self.tg.send(
-            f"🤖 <b>Liquidity Sweep signal bot started</b>\n"
-            f"Scanning {len(pairs)} coins with 24h volume ≥ {fmt_usd(cfg.min_24h_volume)} USDT\n"
-            f"Coin list refreshes every {cfg.pair_refresh_min:g} min\n"
+            f"🤖 <b>{BOT_NAME} started</b>\n"
+            f"Scanning {len(pairs)} coins with 24h futures volume ≥ {fmt_usd(cfg.min_24h_volume)} USDT\n"
+            f"4H trend → {'15m check → ' if cfg.use_15m_filter else ''}1m EMA {cfg.entry_ema} "
+            f"cross + retest + big candle (within {cfg.retest_window_min:g} min)\n"
             f"🟢 = LONG   🔴 = SHORT   (signals only, no trading)"
         )
-        self.journal.write("start", pairs=list(pairs))
+        self.journal.write("start", strategy="ema_retest", pairs=list(pairs))
         self._restart_feed()
-        await asyncio.gather(self.evaluator(), self.zone_refresher(), self.pair_refresher(),
-                             self.status_reporter())
+        await asyncio.gather(self.evaluator(), self.pair_refresher(), self.status_reporter())
 
     async def close(self) -> None:
-        for closer in (self.ex.close, self.tg.close, self.heatmap.close):
+        for closer in (self.ex.close, self.tg.close):
             try:
                 await closer()
             except Exception:
@@ -210,7 +180,7 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, task.cancel)
-        except NotImplementedError:  # Windows
+        except NotImplementedError:
             pass
     error = None
     try:
@@ -225,7 +195,7 @@ async def main() -> None:
         if error:
             await bot.tg.send(f"⚠️ Bot error, restarting in 10 seconds:\n<code>{html.escape(error[:300])}</code>")
         else:
-            await bot.tg.send("⏹ Liquidity Sweep signal bot stopped.")
+            await bot.tg.send(f"⏹ {BOT_NAME} stopped.")
         await bot.close()
 
 

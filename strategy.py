@@ -1,44 +1,45 @@
 """
-RULES 2 + 3 - 5-minute execution inside a valid 4H liquidity zone, with volume filters.
+Strategy: 4H trend + 15m check + 1-minute EMA 50 cross, retest and big candle.
 
-SHORT (upper liquidity sweep) - enters EARLY, while the big green candle is still pushing:
-  1. price is at / inside a fresh 4H resistance zone (a small overshoot above it is allowed)
-  2. the live 5m candle is a big bullish candle (body >= BIG_CANDLE_ATR x 5m ATR)
-     or a strong push (last 2-3 green candles moved >= PUSH_ATR x ATR)
-  3. price sits in the upper part of that candle (UPPER_PART, default top 30%)
-  4. 5m RSI(14) > 80
-  5. volume of the live candle is expanding (projected volume >= VOL_EXPANSION_MULT x 20-candle average)
-  6. 4H volume is normal (no climax spike that already cleared the zone)
-  -> SHORT at market. Stop just above the candle high (or above the zone if that is tighter).
+STEP 1 - 4H trend (decides the direction)
+  Uptrend   : last closed 4H candle above the 4H EMA 50, and the EMA 50 higher than 3 candles ago -> LONG only
+  Downtrend : last closed 4H candle below the 4H EMA 50, and the EMA 50 lower than 3 candles ago  -> SHORT only
+  Otherwise : no trade on this coin
 
-LONG (lower liquidity sweep) - two steps, as in the rules:
-  Step A "ARM": price is at / inside a fresh 4H support zone, a big red candle is pushing down,
-                5m RSI(14) <= 30 (<= 25 = stronger), volume expanding, 4H volume normal.
-                The bot does NOT buy yet. It follows the sweep low.
-  Step B "TRIGGER": the first closed 5m candle that
-                * is green,
-                * closed back above the zone floor and RECLAIM_ATR x ATR above the sweep low,
-                * has volume >= RECLAIM_VOL_MULT x average (volume shift to buyers),
-                * shows RSI turning up from its low,
-                -> LONG at market. Stop just below the sweep low (or below the zone if tighter).
-  The armed setup is cancelled if no reclaim comes within ARM_EXPIRY_BARS candles
-  or if a 5m candle closes far below the zone (the zone failed).
+STEP 2 - 15m check (USE_15M_FILTER)
+  LONG  : last closed 15m candle above the 15m EMA 50
+  SHORT : last closed 15m candle below the 15m EMA 50
 
-RULE 4 targets:
-  TP1 (TP1_CLOSE_PCT of the position) = the opposite 4H liquidity zone if it is between
-  MIN_TP1_R and MAX_LIQ_TP_R away, otherwise TP1_R x risk.
-  TP2 (rest) = the next liquidity zone after that, otherwise TP2_R x risk.
+STEP 3 - 1m entry (all within RETEST_WINDOW_MIN = 15 minutes after the cross)
+  LONG:
+   a) Cross   : a 1m candle closes above the 1m EMA 50 (the candle before closed at or below it)
+   b) Retest  : a LATER candle touches the EMA 50 (its low reaches the EMA, a tiny tolerance allowed)
+                and does not close clearly below it. It can be the very next candle.
+   c) Confirm : a SEPARATE candle after the retest is a big green candle:
+                body >= BIG_CANDLE_MULT x average body of the last 20 candles,
+                volume >= CONFIRM_VOL_MULT x average volume,
+                closes above the EMA 50 and above the high of the retest candle.
+   -> LONG at the close of the confirmation candle.
+  Cancelled if a candle closes clearly below the EMA 50, if 15 minutes pass,
+  or if the 4H / 15m direction no longer agrees.
+  SHORT: exactly the opposite.
+
+STEP 4 - stop and targets
+  Stop  : just beyond the retest wick (lowest retest low for LONG, highest retest high for SHORT),
+          never closer than MIN_SL_PCT % from entry; setups with a stop wider than MAX_SL_PCT % are skipped.
+  TP1   : TP1_R x risk (close TP1_CLOSE_PCT %, stop to entry)
+  TP2   : TP2_R x risk (the rest)
 """
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
 
-from .indicators import atr, rsi_series
+from .indicators import atr, ema_series
 from .state import SymbolState
-from .utils import C, H, L, O, T, TF_MS, V, fmt_price
-from .zones import Zone
+from .utils import C, H, L, O, T, V, fmt_price, utc_str
 
 log = logging.getLogger("strategy")
+MIN_MS = 60_000
 
 
 @dataclass
@@ -50,8 +51,6 @@ class Signal:
     sl: float
     tp1: float
     tp2: float
-    zone: Zone
-    rsi: float
     quality: str              # "A+" or "A"
     reasons: list = field(default_factory=list)
     target_note: str = ""
@@ -68,262 +67,172 @@ class Signal:
 class Strategy:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.rsi_moments = 0          # RSI hit the trigger level (for the status report)
-        self.missing = Counter()      # which condition blocked those moments
+        self.stats = Counter()        # crosses, retests, expired, failed... for the status report
 
-    # ------------------------------------------------------------------ main
+    # ------------------------------------------------------------ trends
+    def trend_4h(self, st: SymbolState) -> str | None:
+        """'UP', 'DOWN' or None (no clear trend)."""
+        c4 = list(st.candles["4h"])
+        n = self.cfg.trend_slope_bars
+        if len(c4) < self.cfg.trend_ema + n + 1:
+            return None
+        ema = ema_series([c[C] for c in c4], self.cfg.trend_ema)
+        if ema[-1] is None or ema[-1 - n] is None:
+            return None
+        close = c4[-1][C]
+        if close > ema[-1] and ema[-1] > ema[-1 - n]:
+            return "UP"
+        if close < ema[-1] and ema[-1] < ema[-1 - n]:
+            return "DOWN"
+        return None
+
+    def check_15m(self, st: SymbolState, side: str) -> tuple[bool, float | None]:
+        if not self.cfg.use_15m_filter:
+            return True, None
+        c15 = list(st.candles["15m"])
+        if len(c15) < self.cfg.mid_ema + 1:
+            return False, None
+        ema = ema_series([c[C] for c in c15], self.cfg.mid_ema)[-1]
+        close = c15[-1][C]
+        ok = close > ema if side == "LONG" else close < ema
+        return ok, ema
+
+    def direction(self, st: SymbolState) -> tuple[str | None, str]:
+        """Allowed side for this coin right now, plus a reason text."""
+        trend = self.trend_4h(st)
+        if trend is None:
+            return None, "no clear 4H trend"
+        side = "LONG" if trend == "UP" else "SHORT"
+        ok15, _ = self.check_15m(st, side)
+        if not ok15:
+            return None, f"15m against 4H {trend.lower()}trend"
+        return side, ""
+
+    # -------------------------------------------------------------- main
     def evaluate(self, st: SymbolState, now_ms: int) -> Signal | None:
+        """Runs on every new CLOSED 1m candle."""
+        closed = list(st.candles["1m"])
+        if len(closed) < self.cfg.entry_ema + 25:
+            return None
+        new = [c for c in closed if c[T] > st.last_closed_checked]
+        if not new:
+            return None
+        st.last_closed_checked = closed[-1][T]
+        if len(new) > 3:                  # after a data gap, only look at the latest candles
+            new = new[-3:]
+
+        ema = ema_series([c[C] for c in closed], self.cfg.entry_ema)
+        signal = None
+        for c in new:
+            i = next(k for k in range(len(closed) - 1, -1, -1) if closed[k][T] == c[T])
+            signal = self._step(st, closed, ema, i, now_ms) or signal
+            if signal:
+                break
+        return signal
+
+    def _step(self, st: SymbolState, closed: list, ema: list, i: int, now_ms: int) -> Signal | None:
         cfg = self.cfg
-        if st.live_5m is None or len(st.candles_5m) < 60 or not st.zones or st.atr_4h <= 0:
+        c, prev = closed[i], closed[i - 1]
+        e, e_prev = ema[i], ema[i - 1]
+        if e is None or e_prev is None:
             return None
-        if now_ms / 1000 < st.cooldown_until:
+        window = closed[max(0, i - 20):i]
+        a1 = atr([x[H] for x in closed[max(0, i - 60):i + 1]],
+                 [x[L] for x in closed[max(0, i - 60):i + 1]],
+                 [x[C] for x in closed[max(0, i - 60):i + 1]], 14)
+        avg_body = sum(abs(x[C] - x[O]) for x in window) / len(window)
+        avg_vol = sum(x[V] for x in window) / len(window)
+        if a1 <= 0 or avg_body <= 0:
             return None
+        touch_tol = cfg.touch_tolerance_atr * a1
+        close_tol = cfg.close_tolerance_atr * a1
 
-        closed = list(st.candles_5m)
-        live = st.live_5m
-        closes = [c[C] for c in closed] + [live[C]]
-        rsi_vals = rsi_series(closes, cfg.rsi_period)
-        rsi_now = float(rsi_vals[-1])
-        atr5 = atr([c[H] for c in closed], [c[L] for c in closed], [c[C] for c in closed], 14)
-        if atr5 <= 0 or rsi_now != rsi_now:  # NaN check
+        side, why_not = self.direction(st)
+        s = st.setup
+
+        # ---- an active setup: check expiry, direction, failure, retest, confirmation
+        if s:
+            if c[T] - s["cross_ts"] > cfg.retest_window_min * MIN_MS:
+                self.stats["expired"] += 1
+                log.info("%s %s setup expired (no confirmation within %g min)", st.symbol, s["side"], cfg.retest_window_min)
+                st.setup = s = None
+            elif side != s["side"]:
+                self.stats["cancelled_trend"] += 1
+                log.info("%s %s setup cancelled: %s", st.symbol, s["side"], why_not or "direction changed")
+                st.setup = s = None
+
+        if s:
+            long_ = s["side"] == "LONG"
+            failed = c[C] < e - close_tol if long_ else c[C] > e + close_tol
+            if failed:
+                self.stats["failed"] += 1
+                log.info("%s %s setup failed: closed back through EMA 50", st.symbol, s["side"])
+                st.setup = s = None
+            else:
+                touched = c[L] <= e + touch_tol if long_ else c[H] >= e - touch_tol
+                body = (c[C] - c[O]) if long_ else (c[O] - c[C])
+                if s["phase"] == "confirm":
+                    big = body >= cfg.big_candle_mult * avg_body
+                    vol_ok = c[V] >= cfg.confirm_vol_mult * avg_vol
+                    beyond = c[C] > max(e, s["retest_high"]) if long_ else c[C] < min(e, s["retest_low"])
+                    if body > 0 and big and vol_ok and beyond:
+                        return self._signal(st, c, e, s, body / avg_body, c[V] / avg_vol if avg_vol else 0, a1, now_ms)
+                    if body > 0 and big and beyond and not vol_ok:
+                        self.stats["low_volume"] += 1
+                if touched:
+                    if s["phase"] == "retest":
+                        self.stats["retests"] += 1
+                        log.info("%s %s retest of EMA 50 at %s", st.symbol, s["side"], fmt_price(e))
+                    s["phase"] = "confirm"
+                    s["retest_ts"] = c[T]
+                    s["retest_low"] = min(s.get("retest_low", c[L]), c[L]) if long_ else c[L]
+                    s["retest_high"] = c[H] if long_ else max(s.get("retest_high", c[H]), c[H])
+                    s["stop_ref"] = min(s.get("stop_ref", c[L]), c[L]) if long_ else max(s.get("stop_ref", c[H]), c[H])
+                return None
+
+        # ---- no setup: look for a new cross in the allowed direction
+        if side is None:
             return None
-
-        recent_vols = [c[V] for c in closed[-20:]]
-        vol_avg = sum(recent_vols) / len(recent_vols)
-        progress = min(1.0, max(0.0, (now_ms - live[T]) / TF_MS["5m"]))
-        projected_vol = live[V] / max(progress, cfg.min_candle_progress)
-        vol_ratio = projected_vol / vol_avg if vol_avg > 0 else 0.0
-
-        htf_ok, htf_note = self._htf_volume_ok(st, now_ms)
-        ctx = dict(closed=closed, live=live, rsi_vals=rsi_vals, rsi=rsi_now, atr5=atr5,
-                   vol_avg=vol_avg, vol_ratio=vol_ratio, htf_ok=htf_ok, htf_note=htf_note,
-                   price=live[C], now_ms=now_ms)
-
-        # 1) a LONG that is already armed waits for its reclaim candle
-        if st.armed_long:
-            return self._manage_armed_long(st, ctx)
-        # 2) new SHORT sweep?
-        sig = self._check_short(st, ctx)
-        if sig:
-            return sig
-        # 3) new LONG sweep to arm?
-        self._check_long_arm(st, ctx)
-        if not st.armed_long:
-            self._diagnose(st, ctx)
+        crossed_up = prev[C] <= e_prev and c[C] > e
+        crossed_down = prev[C] >= e_prev and c[C] < e
+        if (side == "LONG" and crossed_up) or (side == "SHORT" and crossed_down):
+            st.setup = {"side": side, "cross_ts": c[T], "phase": "retest", "cross_price": c[C]}
+            self.stats["crosses"] += 1
+            log.debug("%s %s cross of 1m EMA 50 at %s", st.symbol, side, fmt_price(c[C]))
         return None
 
-    # ------------------------------------------------- near-miss diagnosis
-    def _diagnose(self, st: SymbolState, x: dict) -> None:
-        """When RSI reaches the trigger but no signal comes, log which condition was missing.
-        Max once per 5 minutes per pair. Shown in logs and in the Telegram status report."""
-        cfg, rsi = self.cfg, x["rsi"]
-        if rsi > cfg.rsi_short:
-            side, kind = "SHORT", "resistance"
-        elif rsi <= cfg.rsi_long:
-            side, kind = "LONG", "support"
-        else:
-            return
-        if x["now_ms"] - st.last_diag_ms < 300_000:
-            return
-        st.last_diag_ms = x["now_ms"]
-        live, atr5, price, a4 = x["live"], x["atr5"], x["price"], st.atr_4h
-        reach = max(cfg.zone_proximity_atr, cfg.max_overshoot_atr) * a4
-        at_zone = any(z.kind == kind and z.bottom - reach <= price <= z.top + reach for z in st.zones)
-        body = abs(live[C] - live[O])
-        rng = live[H] - live[L]
-        missing = []
-        if not at_zone:
-            missing.append("not at a 4H zone")
-        if body < cfg.big_candle_atr * atr5:
-            missing.append("candle too small")
-        if x["vol_ratio"] < cfg.vol_expansion:
-            missing.append("volume too low")
-        if not x["htf_ok"]:
-            missing.append("4H volume climax")
-        if side == "SHORT" and rng > 0 and (live[C] - live[L]) / rng < cfg.upper_part:
-            missing.append("price not at top of candle")
-        if side == "SHORT" and live[C] <= live[O]:
-            missing.append("candle not green")
-        if side == "LONG" and live[C] >= live[O]:
-            missing.append("candle not red")
-        self.rsi_moments += 1
-        for m in missing or ["other"]:
-            self.missing[m] += 1
-        log.info("%s %s near miss | RSI %.1f | candle %.1fx ATR | volume %.1fx | missing: %s",
-                 st.symbol, side, rsi, body / atr5, x["vol_ratio"], ", ".join(missing) or "other")
-
-    # ----------------------------------------------------- RULE 3 (4H volume)
-    def _htf_volume_ok(self, st: SymbolState, now_ms: int) -> tuple[bool, str]:
-        c4 = st.candles_4h
-        if len(c4) < 21:
-            return True, "4H volume n/a"
-        avg = sum(c[V] for c in c4[-21:-1]) / 20
-        if avg <= 0:
-            return True, "4H volume n/a"
-        last_ratio = c4[-1][V] / avg
-        live_ratio = 0.0
-        if st.live_4h:
-            progress = min(1.0, max(0.0, (now_ms - st.live_4h[T]) / TF_MS["4h"]))
-            live_ratio = st.live_4h[V] / max(progress, 0.25) / avg
-        ok = last_ratio <= self.cfg.htf_climax_mult and live_ratio <= self.cfg.htf_climax_mult
-        return ok, f"4H volume {last_ratio:.1f}x last / {live_ratio:.1f}x live (limit {self.cfg.htf_climax_mult}x)"
-
-    # ------------------------------------------------------------------ SHORT
-    def _check_short(self, st: SymbolState, x: dict) -> Signal | None:
-        cfg, live, closed, price, atr5 = self.cfg, x["live"], x["closed"], x["price"], x["atr5"]
-        o, h, l, c = live[O], live[H], live[L], live[C]
-        if c <= o:
-            return None
-        big = (c - o) >= cfg.big_candle_atr * atr5
-        push = (closed[-1][C] > closed[-1][O]
-                and (c - min(closed[-1][O], closed[-2][O])) >= cfg.push_atr * atr5)
-        if not (big or push):
-            return None
-        rng = h - l
-        if rng <= 0 or (c - l) / rng < cfg.upper_part:
-            return None
-        if x["rsi"] <= cfg.rsi_short:
-            return None
-
-        for z in st.zones:
-            if z.kind != "resistance":
-                continue
-            if not (z.bottom - cfg.zone_proximity_atr * st.atr_4h <= price <= z.top + cfg.max_overshoot_atr * st.atr_4h):
-                continue
-            if x["vol_ratio"] < cfg.vol_expansion:
-                log.debug("%s SHORT skipped: volume %.1fx < %.1fx", st.symbol, x["vol_ratio"], cfg.vol_expansion)
-                return None
-            if not x["htf_ok"]:
-                log.info("%s SHORT skipped: %s", st.symbol, x["htf_note"])
-                return None
-
-            # Stop just beyond the sweeping candle's high, or beyond the zone if that is tighter.
-            # We enter before the candle is finished, so the high can still grow a little:
-            # SWEEP_ROOM adds part of the candle size as room above the high.
-            buf = cfg.sl_buffer_atr * atr5
-            min_dist = max(cfg.min_sl_atr * atr5, price * cfg.min_sl_pct / 100)
-            candle_stop = h + max(buf, cfg.sweep_room * rng)
-            candidates = [s for s in (candle_stop, z.top + buf) if s - price >= min_dist]
-            sl = min(candidates) if candidates else price + min_dist
-            if (sl - price) / price * 100 > cfg.max_sl_pct:
-                log.info("%s SHORT skipped: stop too wide", st.symbol)
-                return None
-
-            tp1, tp2, note = self._targets("SHORT", price, sl, st)
-            strong = x["rsi"] >= 85 and z.strength >= 3
-            reasons = [
-                f"4H zone: {z.describe()}",
-                f"5m RSI {x['rsi']:.1f} > {cfg.rsi_short:g}",
-                f"Big green 5m candle {(c - o) / atr5:.1f}x ATR, price in top {(1 - (c - l) / rng) * 100:.0f}% of it",
-                f"5m volume {x['vol_ratio']:.1f}x average (expanding)",
-                x["htf_note"],
-            ]
-            return Signal(st.symbol, st.ccxt_symbol, "SHORT", price, sl, tp1, tp2, z, x["rsi"],
-                          "A+" if strong else "A", reasons, note, x["now_ms"])
-        return None
-
-    # --------------------------------------------------------- LONG step A
-    def _check_long_arm(self, st: SymbolState, x: dict) -> None:
-        cfg, live, closed, price, atr5 = self.cfg, x["live"], x["closed"], x["price"], x["atr5"]
-        o, l, c = live[O], live[L], live[C]
-        if c >= o:
-            return
-        big = (o - c) >= cfg.big_candle_atr * atr5
-        push = (closed[-1][C] < closed[-1][O]
-                and (max(closed[-1][O], closed[-2][O]) - c) >= cfg.push_atr * atr5)
-        if not (big or push) or x["rsi"] > cfg.rsi_long:
-            return
-        if x["vol_ratio"] < cfg.vol_expansion or not x["htf_ok"]:
-            return
-        for z in st.zones:
-            if z.kind != "support":
-                continue
-            if z.bottom - cfg.max_overshoot_atr * st.atr_4h <= price <= z.top + cfg.zone_proximity_atr * st.atr_4h:
-                st.armed_long = {
-                    "zone": z, "sweep_low": l, "armed_candle": live[T], "rsi_min": x["rsi"],
-                    "sweep_vol": x["vol_ratio"], "armed_price": price,
-                }
-                st.last_closed_checked = closed[-1][T]
-                log.info("%s LONG ARMED at %s | RSI %.1f | vol %.1fx | %s",
-                         st.symbol, fmt_price(price), x["rsi"], x["vol_ratio"], z.describe())
-                return
-
-    # --------------------------------------------------------- LONG step B
-    def _manage_armed_long(self, st: SymbolState, x: dict) -> Signal | None:
-        cfg, a, live, closed = self.cfg, st.armed_long, x["live"], x["closed"]
-        z: Zone = a["zone"]
-        a["sweep_low"] = min(a["sweep_low"], live[L])
-        a["rsi_min"] = min(a["rsi_min"], x["rsi"])
-
-        if (live[T] - a["armed_candle"]) // TF_MS["5m"] > cfg.arm_expiry_bars:
-            log.info("%s LONG setup expired (no reclaim)", st.symbol)
-            st.armed_long = None
-            return None
-
-        last = closed[-1]
-        if last[T] < a["armed_candle"] or last[T] == st.last_closed_checked:
-            return None                       # wait for a new closed candle
-        st.last_closed_checked = last[T]
-        a["sweep_low"] = min(a["sweep_low"], last[L])
-
-        if last[C] < z.bottom - cfg.max_overshoot_atr * st.atr_4h:
-            log.info("%s LONG setup cancelled: closed below the zone (zone failed)", st.symbol)
-            st.armed_long = None
-            return None
-
-        atr5, price = x["atr5"], x["price"]
-        green = last[C] > last[O]
-        reclaim = last[C] >= a["sweep_low"] + cfg.reclaim_atr * atr5 and last[C] >= z.bottom
-        vol_shift = last[V] >= cfg.reclaim_vol * x["vol_avg"]
-        rsi_last_closed = float(x["rsi_vals"][-2])
-        rsi_turn = rsi_last_closed > a["rsi_min"] + 2
-        if not (green and reclaim and vol_shift and rsi_turn):
-            return None
-
-        buf = cfg.sl_buffer_atr * atr5
-        min_dist = max(cfg.min_sl_atr * atr5, price * cfg.min_sl_pct / 100)
-        candidates = [s for s in (a["sweep_low"] - buf, z.bottom - buf) if price - s >= min_dist]
-        sl = max(candidates) if candidates else price - min_dist
-        st.armed_long = None
-        if (price - sl) / price * 100 > cfg.max_sl_pct:
-            log.info("%s LONG skipped: stop too wide", st.symbol)
-            return None
-
-        tp1, tp2, note = self._targets("LONG", price, sl, st)
-        strong = a["rsi_min"] <= cfg.rsi_long_strong and z.strength >= 3
-        reasons = [
-            f"4H zone: {z.describe()}",
-            f"5m RSI low {a['rsi_min']:.1f} (<= {cfg.rsi_long:g}{', strong' if a['rsi_min'] <= cfg.rsi_long_strong else ''}), now turning up",
-            f"Sweep low {fmt_price(a['sweep_low'])}, sweep volume {a['sweep_vol']:.1f}x",
-            f"Green reclaim candle, volume {last[V] / x['vol_avg']:.1f}x average",
-            x["htf_note"],
-        ]
-        return Signal(st.symbol, st.ccxt_symbol, "LONG", price, sl, tp1, tp2, z, a["rsi_min"],
-                      "A+" if strong else "A", reasons, note, x["now_ms"])
-
-    # ---------------------------------------------------------------- targets
-    def _targets(self, side: str, entry: float, sl: float, st: SymbolState) -> tuple[float, float, str]:
+    # ------------------------------------------------------------ signal
+    def _signal(self, st: SymbolState, c: list, e: float, s: dict, body_x: float, vol_x: float,
+                a1: float, now_ms: int) -> Signal | None:
         cfg = self.cfg
+        long_ = s["side"] == "LONG"
+        entry = c[C]
+        buf = cfg.sl_buffer_atr * a1
+        min_dist = entry * cfg.min_sl_pct / 100
+        sl = s["stop_ref"] - buf if long_ else s["stop_ref"] + buf
+        if abs(entry - sl) < min_dist:
+            sl = entry - min_dist if long_ else entry + min_dist
+        st.setup = None
+        risk_pct = abs(entry - sl) / entry * 100
+        if risk_pct > cfg.max_sl_pct:
+            self.stats["stop_too_wide"] += 1
+            log.info("%s %s skipped: stop %.2f%% wider than %g%%", st.symbol, s["side"], risk_pct, cfg.max_sl_pct)
+            return None
         risk = abs(entry - sl)
-        sign = 1 if side == "LONG" else -1
+        sign = 1 if long_ else -1
         tp1 = entry + sign * cfg.tp1_r * risk
         tp2 = entry + sign * cfg.tp2_r * risk
-        note = f"fixed {cfg.tp1_r:g}R / {cfg.tp2_r:g}R"
-        if not cfg.use_liquidity_targets:
-            return tp1, tp2, note
-        if side == "LONG":
-            levels = sorted(z.bottom for z in st.zones if z.kind == "resistance" and z.bottom > entry)
-        else:
-            levels = sorted((z.top for z in st.zones if z.kind == "support" and z.top < entry), reverse=True)
-        levels = [p for p in levels if cfg.min_tp1_r * risk <= abs(p - entry) <= cfg.max_liq_tp_r * risk]
-        if levels:
-            tp1 = levels[0]
-            note = "TP1 at opposite 4H liquidity"
-            if len(levels) > 1:
-                tp2 = levels[1]
-                note += ", TP2 at next liquidity"
-            else:
-                extra = (cfg.tp2_r - cfg.tp1_r) * risk
-                tp2 = entry + sign * max(cfg.tp2_r * risk, abs(tp1 - entry) + extra)
-                note += f", TP2 fixed"
-        return tp1, tp2, note
+
+        trend_word = "uptrend: price above rising EMA 50" if long_ else "downtrend: price below falling EMA 50"
+        mid = "above" if long_ else "below"
+        colour = "green" if long_ else "red"
+        reasons = [
+            f"4H {trend_word}",
+            f"15m: price {mid} EMA 50" if cfg.use_15m_filter else "15m check off",
+            f"1m: crossed EMA 50 at {utc_str(s['cross_ts'])[11:16]} UTC, retest at {utc_str(s['retest_ts'])[11:16]} UTC",
+            f"Big {colour} candle: body {body_x:.1f}x average, volume {vol_x:.1f}x average",
+        ]
+        quality = "A+" if body_x >= 2.5 and vol_x >= 2.0 else "A"
+        self.stats["signals"] += 1
+        return Signal(st.symbol, st.ccxt_symbol, s["side"], entry, sl, tp1, tp2, quality, reasons,
+                      f"TP1 {cfg.tp1_r:g}R, TP2 {cfg.tp2_r:g}R", now_ms)

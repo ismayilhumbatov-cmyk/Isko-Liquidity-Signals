@@ -75,12 +75,6 @@ def signal_message(sig, cfg, volume_24h: float = 0.0) -> str:
     return "\n".join(lines)
 
 
-def armed_message(symbol: str, armed: dict) -> str:
-    return (f"🟡 <b>Watching LONG #{_e(symbol)}</b>\n"
-            f"Sweep into support {fmt_price(armed['zone'].bottom)} - {fmt_price(armed['zone'].top)}, "
-            f"RSI {armed['rsi_min']:.1f}. Waiting for reclaim candle.")
-
-
 def exit_message(s, reason: str, share: float, price: float, r: float, moved_be: bool) -> str:
     icon = {"TP1": "✅", "TP2": "🎯", "SL": "🛑", "BE": "⚖️"}.get(reason, "ℹ️")
     name = {"TP1": "TP1 hit", "TP2": "TP2 hit", "SL": "Stop loss hit", "BE": "Breakeven"}.get(reason, reason)
