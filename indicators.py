@@ -64,3 +64,29 @@ def ema_series(values, period: int = 50) -> list:
         e = v[i] * k + e * (1 - k)
         out[i] = e
     return out
+
+
+def market_structure(candles, pivot: int = 3) -> tuple:
+    """Market structure from closed candles [t, o, h, l, c, v].
+    A swing high/low is confirmed once `pivot` candles on each side are lower/higher.
+    A candle CLOSING above the last swing high turns the structure 'bull';
+    closing below the last swing low turns it 'bear' (a market structure shift / CHoCH).
+    Returns (state, time_of_last_shift, direction_of_last_shift, last_swing_high, last_swing_low)."""
+    n = len(candles)
+    highs = [c[2] for c in candles]
+    lows = [c[3] for c in candles]
+    swing_high = swing_low = None
+    state = shift_ts = shift_dir = None
+    for i in range(n):
+        j = i - pivot
+        if j >= pivot:
+            if highs[j] == max(highs[j - pivot:j + pivot + 1]):
+                swing_high = highs[j]
+            if lows[j] == min(lows[j - pivot:j + pivot + 1]):
+                swing_low = lows[j]
+        close = candles[i][4]
+        if swing_high is not None and close > swing_high and state != "bull":
+            state, shift_ts, shift_dir = "bull", candles[i][0], "bull"
+        elif swing_low is not None and close < swing_low and state != "bear":
+            state, shift_ts, shift_dir = "bear", candles[i][0], "bear"
+    return state, shift_ts, shift_dir, swing_high, swing_low

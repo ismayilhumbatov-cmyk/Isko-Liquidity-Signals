@@ -22,7 +22,7 @@ from bot.state import SymbolState
 from bot.strategy import Strategy
 from bot.symbols import select_symbols
 from bot.tracker import SignalTracker
-from bot.utils import Journal, fmt_usd, now_ms, setup_logging
+from bot.utils import Journal, fmt_usd, now_ms, setup_logging, utc_str
 
 log = logging.getLogger("main")
 BOT_NAME = "Trend + EMA 50 Retest signal bot"
@@ -68,6 +68,7 @@ class Bot:
             self.states[pid] = st
             new_states.append(st)
         await self.feed.bootstrap(new_states)
+        self.strategy.btc = self.states.get("BTCUSDT")
         self._restart_feed()
         log.info("Coins updated: +%d %s | -%d %s | now %d", len(added), ",".join(added),
                  len(removed), ",".join(removed), len(self.states))
@@ -127,25 +128,36 @@ class Bot:
             await asyncio.sleep(self.cfg.status_hours * 3600)
 
     async def _send_status(self) -> None:
-        up = down = flat = long_ok = short_ok = 0
+        now = now_ms()
+        up = down = flat = long_ok = short_ok = shifted = 0
         for st in list(self.states.values()):
             t = self.strategy.trend_4h(st)
             up += t == "UP"
             down += t == "DOWN"
             flat += t is None
-            side, _ = self.strategy.direction(st)
+            side, why, _ = self.strategy.direction(st, now)
             long_ok += side == "LONG"
             short_ok += side == "SHORT"
+            shifted += why.startswith("1H")
         s = self.strategy.stats
         data = "REST polling (slower)" if self.feed and self.feed.use_rest else "live"
         age = self.newest_1m_age_min()
+        bdir, bend = self.strategy.btc_shift(now)
+        if bdir:
+            paused = "SHORT" if bdir == "bull" else "LONG"
+            btc_line = f"BTC shifted {'up' if bdir == 'bull' else 'down'}: {paused} paused until {utc_str(bend)[11:16]} UTC"
+        else:
+            btc_line = "BTC: no recent structure shift, no pause"
         text = (
             f"📊 <b>Status</b>\n"
             f"Coins: {len(self.states)}  •  data: {data}  •  newest 1m candle: {max(age, 0):.0f} min old\n"
             f"1m candles checked: {s['candles']}\n"
             f"4H trend: {up} up • {down} down • {flat} no trend\n"
-            f"Ready now (4H + 15m agree): {long_ok} LONG • {short_ok} SHORT\n"
+            f"1H structure shifted against 4H: {shifted} coins\n"
+            f"{btc_line}\n"
+            f"Ready now: {long_ok} LONG • {short_ok} SHORT\n"
             f"Crosses with trend: {s['crosses']}  •  Retests: {s['retests']}\n"
+            f"Blocked by 1H shift: {s['blocked_1h']}  •  by BTC shift: {s['blocked_btc']}\n"
             f"Expired: {s['expired']}  •  Failed: {s['failed']}  •  Weak volume: {s['low_volume']}\n"
             f"Signals sent: {s['signals']}  •  Open: {len(self.tracker.open)}"
         )
@@ -186,12 +198,15 @@ class Bot:
         self.states = {pid: SymbolState(pid, sym, volume_24h=vol) for pid, (sym, vol) in pairs.items()}
         log.info("Loading history for %d coins (a few minutes)...", len(pairs))
         self.feed = MarketFeed(cfg, self.ex, self.states)
+        self.strategy.btc = self.states.get("BTCUSDT")
         await self.feed.bootstrap()
 
         await self.tg.send(
             f"🤖 <b>{BOT_NAME} started</b>\n"
             f"Scanning {len(pairs)} coins with 24h futures volume ≥ {fmt_usd(cfg.min_24h_volume)} USDT\n"
-            f"4H trend → {'15m check → ' if cfg.use_15m_filter else ''}1m EMA {cfg.entry_ema} "
+            f"4H trend → {'15m check → ' if cfg.use_15m_filter else ''}"
+            f"{'1H shift filter → ' if cfg.use_shift_filter else ''}{'BTC shift filter → ' if cfg.use_btc_filter else ''}"
+            f"1m EMA {cfg.entry_ema} "
             f"cross + retest + big candle (within {cfg.retest_window_min:g} min)\n"
             f"🟢 = LONG   🔴 = SHORT   (signals only, no trading)"
         )

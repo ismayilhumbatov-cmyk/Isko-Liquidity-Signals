@@ -1,8 +1,8 @@
 """
 Market data from Binance USDT-M Futures (public data, no keys).
 
-* Start-up: loads history over REST for every coin: 300 x 1m, 200 x 15m, 300 x 4H candles.
-* Live: WebSocket kline streams (1m, 15m, 4H) for every coin. Binance pushes every price
+* Start-up: loads history over REST for every coin: 300 x 1m, 200 x 15m, 200 x 1H, 300 x 4H candles.
+* Live: WebSocket kline streams (1m, 15m, 1H, 4H) for every coin. Binance pushes every price
   change instantly, so a closed 1m candle reaches the bot within about a second.
 * Safety net: if the WebSocket keeps failing, the bot switches to REST polling by itself.
 """
@@ -159,6 +159,7 @@ class MarketFeed:
                     await self._fetch(st, "1m", 3)
                     if refresh_slow:
                         await self._fetch(st, "15m", 3)
+                        await self._fetch(st, "1h", 3)
                         await self._fetch(st, "4h", 3)
                 except Exception as e:
                     log.warning("REST poll %s: %s", st.symbol, e)

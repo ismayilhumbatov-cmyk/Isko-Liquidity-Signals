@@ -66,6 +66,12 @@ class Config:
     use_15m_filter: bool = field(default_factory=lambda: _bool("USE_15M_FILTER", True))
     mid_ema: int = field(default_factory=lambda: _int("MID_EMA", 50))
 
+    # --------------------------------------- market structure shift filters
+    use_shift_filter: bool = field(default_factory=lambda: _bool("USE_SHIFT_FILTER", True))
+    shift_pivot: int = field(default_factory=lambda: _int("SHIFT_PIVOT", 3))
+    use_btc_filter: bool = field(default_factory=lambda: _bool("USE_BTC_FILTER", True))
+    btc_pause_min: float = field(default_factory=lambda: _float("BTC_PAUSE_MIN", 60))
+
     # ------------------------------------------- step 3: 1m cross/retest
     entry_ema: int = field(default_factory=lambda: _int("ENTRY_EMA", 50))
     retest_window_min: float = field(default_factory=lambda: _float("RETEST_WINDOW_MIN", 15))

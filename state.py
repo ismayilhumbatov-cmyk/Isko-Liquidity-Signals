@@ -2,8 +2,8 @@
 from collections import deque
 from dataclasses import dataclass, field
 
-TIMEFRAMES = ("1m", "15m", "4h")
-HISTORY = {"1m": 300, "15m": 200, "4h": 300}     # candles loaded at start
+TIMEFRAMES = ("1m", "15m", "1h", "4h")
+HISTORY = {"1m": 300, "15m": 200, "1h": 200, "4h": 300}     # candles loaded at start
 
 
 def _stores() -> dict:

@@ -10,6 +10,12 @@ STEP 2 - 15m check (USE_15M_FILTER)
   LONG  : last closed 15m candle above the 15m EMA 50
   SHORT : last closed 15m candle below the 15m EMA 50
 
+STEP 2b - market structure shift filters
+  1H shift (USE_SHIFT_FILTER): if the coin's 1H chart closed above its last swing high (structure turned up),
+           no SHORT signals; if it closed below its last swing low (turned down), no LONG signals.
+  BTC shift (USE_BTC_FILTER): when Bitcoin's 15m structure shifts up, SHORT signals on all coins pause
+           for BTC_PAUSE_MIN minutes; when it shifts down, LONG signals pause.
+
 STEP 3 - 1m entry (all within RETEST_WINDOW_MIN = 15 minutes after the cross)
   LONG:
    a) Cross   : a 1m candle closes above the 1m EMA 50 (the candle before closed at or below it)
@@ -34,7 +40,7 @@ import logging
 from collections import Counter
 from dataclasses import dataclass, field
 
-from .indicators import atr, ema_series
+from .indicators import atr, ema_series, market_structure
 from .state import SymbolState
 from .utils import C, H, L, O, T, V, fmt_price, utc_str
 
@@ -68,6 +74,29 @@ class Strategy:
     def __init__(self, cfg):
         self.cfg = cfg
         self.stats = Counter()        # crosses, retests, expired, failed... for the status report
+        self.btc: SymbolState | None = None   # set by main: Bitcoin's live data for the BTC filter
+        self._btc_cache = (None, None)        # (last 15m candle time, result)
+
+    # --------------------------------------------------- structure shifts
+    def structure_1h(self, st: SymbolState) -> str | None:
+        c1h = list(st.candles["1h"])
+        if len(c1h) < 4 * self.cfg.shift_pivot:
+            return None
+        return market_structure(c1h, self.cfg.shift_pivot)[0]
+
+    def btc_shift(self, now_ms: int) -> tuple[str | None, int | None]:
+        """Direction of a BTC 15m structure shift still inside the pause window, and when the pause ends."""
+        if not self.btc or not self.btc.candles["15m"]:
+            return None, None
+        c15 = list(self.btc.candles["15m"])
+        if self._btc_cache[0] != c15[-1][T]:
+            _, ts, direction, _, _ = market_structure(c15, self.cfg.shift_pivot)
+            self._btc_cache = (c15[-1][T], (ts, direction))
+        ts, direction = self._btc_cache[1]
+        if ts is None:
+            return None, None
+        ends = ts + 15 * MIN_MS + int(self.cfg.btc_pause_min * MIN_MS)   # shift candle closes, then the pause
+        return (direction, ends) if now_ms < ends else (None, None)
 
     # ------------------------------------------------------------ trends
     def trend_4h(self, st: SymbolState) -> str | None:
@@ -97,16 +126,28 @@ class Strategy:
         ok = close > ema if side == "LONG" else close < ema
         return ok, ema
 
-    def direction(self, st: SymbolState) -> tuple[str | None, str]:
-        """Allowed side for this coin right now, plus a reason text."""
+    def direction(self, st: SymbolState, now_ms: int | None = None) -> tuple[str | None, str, str | None]:
+        """(allowed side or None, reason when blocked, side the 4H+15m alone would allow)."""
         trend = self.trend_4h(st)
         if trend is None:
-            return None, "no clear 4H trend"
+            return None, "no clear 4H trend", None
         side = "LONG" if trend == "UP" else "SHORT"
         ok15, _ = self.check_15m(st, side)
         if not ok15:
-            return None, f"15m against 4H {trend.lower()}trend"
-        return side, ""
+            return None, f"15m against 4H {trend.lower()}trend", None
+        if self.cfg.use_shift_filter:
+            ms = self.structure_1h(st)
+            if side == "LONG" and ms == "bear":
+                return None, "1H structure shifted down", side
+            if side == "SHORT" and ms == "bull":
+                return None, "1H structure shifted up", side
+        if self.cfg.use_btc_filter and now_ms is not None and st is not self.btc:
+            bdir, _ = self.btc_shift(now_ms)
+            if side == "SHORT" and bdir == "bull":
+                return None, "BTC structure shifted up", side
+            if side == "LONG" and bdir == "bear":
+                return None, "BTC structure shifted down", side
+        return side, "", side
 
     # -------------------------------------------------------------- main
     def evaluate(self, st: SymbolState, now_ms: int) -> Signal | None:
@@ -148,7 +189,7 @@ class Strategy:
         touch_tol = cfg.touch_tolerance_atr * a1
         close_tol = cfg.close_tolerance_atr * a1
 
-        side, why_not = self.direction(st)
+        side, why_not, base_side = self.direction(st, now_ms)
         if side is None:
             self.stats["no_direction"] += 1
         s = st.setup
@@ -194,10 +235,13 @@ class Strategy:
                 return None
 
         # ---- no setup: look for a new cross in the allowed direction
-        if side is None:
-            return None
         crossed_up = prev[C] <= e_prev and c[C] > e
         crossed_down = prev[C] >= e_prev and c[C] < e
+        if side is None:
+            # a cross the 4H/15m would have taken, but a structure shift blocked it
+            if (base_side == "LONG" and crossed_up) or (base_side == "SHORT" and crossed_down):
+                self.stats["blocked_btc" if why_not.startswith("BTC") else "blocked_1h"] += 1
+            return None
         if (side == "LONG" and crossed_up) or (side == "SHORT" and crossed_down):
             st.setup = {"side": side, "cross_ts": c[T], "phase": "retest", "cross_price": c[C]}
             self.stats["crosses"] += 1
@@ -232,6 +276,8 @@ class Strategy:
         reasons = [
             f"4H {trend_word}",
             f"15m: price {mid} EMA 50" if cfg.use_15m_filter else "15m check off",
+            ("1H structure: no shift against the trend" if cfg.use_shift_filter else "1H shift filter off"),
+            ("BTC: no recent structure shift against this direction" if cfg.use_btc_filter else "BTC filter off"),
             f"1m: crossed EMA 50 at {utc_str(s['cross_ts'])[11:16]} UTC, retest at {utc_str(s['retest_ts'])[11:16]} UTC",
             f"Big {colour} candle: body {body_x:.1f}x average, volume {vol_x:.1f}x average",
         ]

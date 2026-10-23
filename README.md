@@ -10,6 +10,10 @@ Price above a rising 4H EMA 50 means uptrend, so LONG only. Price below a fallin
 **2. 15m confirms it.**
 For LONG, the last 15m candle must close above the 15m EMA 50. For SHORT, below it.
 
+**Structure shift filters.**
+- **1H shift:** if the coin's 1H chart closes above its last swing high, the structure has turned up, so no SHORT signals. If it closes below its last swing low, no LONG signals.
+- **BTC shift:** when Bitcoin's 15m structure shifts up, SHORT signals on all coins pause for 60 minutes. When it shifts down, LONG signals pause.
+
 **3. 1m gives the entry, all within 15 minutes:**
 - **Cross:** a 1m candle closes through the EMA 50 in the trend direction.
 - **Retest:** a later candle comes back and touches the EMA 50 without closing through it. It can be the very next candle.
