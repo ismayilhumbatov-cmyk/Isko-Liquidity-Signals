@@ -17,7 +17,7 @@ from .utils import C, T, TF_MS, now_ms
 log = logging.getLogger("data")
 
 MAINNET_WS = "wss://fstream.binance.com"
-STREAMS_PER_CONNECTION = 180
+STREAMS_PER_CONNECTION = 150
 
 
 def _push_closed(store, candle: list) -> bool:
@@ -104,33 +104,46 @@ class MarketFeed:
             st.live[tf] = candle
 
     async def _ws_worker(self, symbols: list[str]) -> None:
+        """One live connection. It connects to the short base address and then subscribes
+        to the coins in small groups (a very long address with all streams is ignored by Binance).
+        If no candle data arrives for 60 seconds, it reconnects; after 3 tries -> REST polling."""
         import websockets
 
         base = self.cfg.ws_url or MAINNET_WS
-        streams = "/".join(f"{s.lower()}@kline_{tf}" for s in symbols for tf in TIMEFRAMES)
-        url = f"{base}/stream?streams={streams}"
+        streams = [f"{s.lower()}@kline_{tf}" for s in symbols for tf in TIMEFRAMES]
         failures, first = 0, True
         while not self.use_rest:
             try:
-                async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=2 ** 22) as ws:
-                    log.info("WebSocket connected (%d coins)", len(symbols))
-                    if not first:
-                        await self._resync_recent()
-                    first, failures = False, 0
-                    async for raw in ws:
+                async with websockets.connect(f"{base}/stream", ping_interval=20, ping_timeout=20,
+                                              max_size=2 ** 22) as ws:
+                    for n in range(0, len(streams), 50):
+                        await ws.send(json.dumps({"method": "SUBSCRIBE", "params": streams[n:n + 50], "id": n + 1}))
+                        await asyncio.sleep(0.3)
+                    log.info("WebSocket connected (%d coins, %d streams)", len(symbols), len(streams))
+                    got_data = False
+                    while True:
                         if self.use_rest:
                             return
+                        raw = await asyncio.wait_for(ws.recv(), timeout=60)
                         msg = json.loads(raw)
                         data = msg.get("data", msg)
-                        if data.get("e") == "kline":
-                            self._apply_kline(data["k"])
+                        if data.get("e") != "kline":
+                            continue
+                        self._apply_kline(data["k"])
+                        if not got_data:
+                            got_data, failures = True, 0
+                            log.info("WebSocket data flowing (%d coins)", len(symbols))
+                            if not first:
+                                await self._resync_recent()
+                            first = False
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 failures += 1
-                log.warning("WebSocket error (%d): %s", failures, e)
-                if failures >= 5:
-                    log.error("WebSocket keeps failing -> switching to REST polling")
+                reason = "no data for 60s" if isinstance(e, asyncio.TimeoutError) else str(e)
+                log.warning("WebSocket problem (%d): %s", failures, reason)
+                if failures >= 3:
+                    log.warning("WebSocket not delivering data -> switching to REST polling")
                     self.use_rest = True
                     return
                 await asyncio.sleep(min(30, 2 ** failures))

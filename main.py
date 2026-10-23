@@ -85,6 +85,34 @@ class Bot:
         log.error("Data feed stopped: %s - restarting in 10s", task.exception())
         asyncio.get_running_loop().call_later(10, self._restart_feed)
 
+    # --------------------------------------------------------- watchdog
+    def newest_1m_age_min(self) -> float:
+        newest = max((st.candles["1m"][-1][0] for st in self.states.values() if st.candles["1m"]), default=0)
+        # a 1m candle closes 1 minute after it opens
+        return (now_ms() - newest - 60_000) / 60_000 if newest else 999.0
+
+    async def data_watchdog(self) -> None:
+        """If no fresh 1m candle arrives for 3 minutes, switch to REST polling and tell the user."""
+        await asyncio.sleep(180)
+        warned = False
+        while True:
+            await asyncio.sleep(60)
+            try:
+                age = self.newest_1m_age_min()
+                if age > 3 and self.feed and not self.feed.use_rest:
+                    log.warning("No fresh 1m candles for %.0f min -> REST polling", age)
+                    self.feed.use_rest = True
+                    self._restart_feed()
+                    await self.tg.send("⚠️ Live data stopped. Switched to direct price checks every ~15 seconds. "
+                                       "Signals keep coming, a few seconds later than live.")
+                elif age > 5 and self.feed and self.feed.use_rest and not warned:
+                    warned = True
+                    await self.tg.send(f"⚠️ No fresh market data for {age:.0f} minutes. Check the server internet.")
+                elif age <= 2:
+                    warned = False
+            except Exception:
+                log.exception("data watchdog failed")
+
     # ----------------------------------------------------------- status
     async def status_reporter(self) -> None:
         """First report 20 minutes after start, then every STATUS_HOURS."""
@@ -110,11 +138,10 @@ class Bot:
             short_ok += side == "SHORT"
         s = self.strategy.stats
         data = "REST polling (slower)" if self.feed and self.feed.use_rest else "live"
-        newest = max((st.candles["1m"][-1][0] for st in self.states.values() if st.candles["1m"]), default=0)
-        age = (now_ms() - newest) / 60000 if newest else -1
+        age = self.newest_1m_age_min()
         text = (
             f"📊 <b>Status</b>\n"
-            f"Coins: {len(self.states)}  •  data: {data}  •  newest 1m candle: {age:.0f} min old\n"
+            f"Coins: {len(self.states)}  •  data: {data}  •  newest 1m candle: {max(age, 0):.0f} min old\n"
             f"1m candles checked: {s['candles']}\n"
             f"4H trend: {up} up • {down} down • {flat} no trend\n"
             f"Ready now (4H + 15m agree): {long_ok} LONG • {short_ok} SHORT\n"
@@ -170,7 +197,8 @@ class Bot:
         )
         self.journal.write("start", strategy="ema_retest", pairs=list(pairs))
         self._restart_feed()
-        await asyncio.gather(self.evaluator(), self.pair_refresher(), self.status_reporter())
+        await asyncio.gather(self.evaluator(), self.pair_refresher(), self.status_reporter(),
+                             self.data_watchdog())
 
     async def close(self) -> None:
         for closer in (self.ex.close, self.tg.close):
